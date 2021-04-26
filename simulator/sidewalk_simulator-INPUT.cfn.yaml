@@ -1,0 +1,353 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. 
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+
+Description: Simulator for sidewalk devices
+
+Parameters:
+  CertificateArn:
+    Description: ARN of the activate AWS IoT certificate
+    Type: String
+  ThingName:
+    Description: An IOT Thing to be created.
+    Type: String
+    Default: SidewalkDevice   
+
+Resources:
+
+  PolicySidewalkSimulatorPipelinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: "IoT Core ploicy to access IoT Analytics"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - "iotanalytics:BatchPutMessage"
+            Resource: 
+              - !Join [
+                  "",
+                  [
+                      "arn:aws:iotanalytics:",
+                       Ref: "AWS::Region",
+                       ":",
+                       Ref: "AWS::AccountId",
+                       ":channel/",
+                       !Ref SidewalkSimulatorDataChannel
+                ],
+              ]
+              
+  RoleSidewalkSimulatorPipelineRole:
+    Type: "AWS::IAM::Role"
+    Properties:    
+      Description: "IoT Core role to access IoT Analytics"    
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - iot.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: PolicySidewalkSimulatorPipelinePolicy
+
+  PolicySidewalkLambdaFunctionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: "Policy to have Lambda functions publish iot / iotwireless data"        
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - "iot:Publish"
+              - "iotwireless:SendDataToWirelessDevice"
+            Resource: "*"
+            
+  RoleSidewalkLambdaFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Description: "Role to have Lambda functions publish iot / iotwireless data"       
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - iot.amazonaws.com
+            - lambda.amazonaws.com
+            - iotanalytics.amazonaws.com
+            - iotwireless.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - Ref: PolicySidewalkLambdaFunctionPolicy
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  RoleSidewalkLambdaExecutionRole:
+    # Role used by CloudFormation created Lambda functions, used by the custom
+    # resource functions to perform their objectives.
+    # Overly permissive for iot:* to reduce Statement complexity
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSIoTConfigAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  SidewalkSimulatorDataChannel:
+    Type: "AWS::IoTAnalytics::Channel"
+    Properties:
+      RetentionPeriod:
+        Unlimited: false
+        NumberOfDays: 30
+        
+  SidewalkSimulatorDatastore:
+    Type: "AWS::IoTAnalytics::Datastore"
+    Properties:
+      RetentionPeriod:
+        Unlimited: false
+        NumberOfDays: 30  
+        
+  SidewalkSimulatorDataPipeline:
+    Type: "AWS::IoTAnalytics::Pipeline"
+    Properties:
+      PipelineActivities:
+        -
+          Channel:
+            Name: "ChannelActivity"        
+            ChannelName: !Ref SidewalkSimulatorDataChannel
+            Next: "TransformActivity"
+          Lambda:
+            Name: "TransformActivity"
+            LambdaName: !Ref SidewalkTransformLambdaFunction
+            BatchSize: 1
+            Next: "DatastoreActivity"
+          Datastore:
+            Name: "DatastoreActivity" 
+            DatastoreName: !Ref SidewalkSimulatorDatastore
+
+  SidewalkSimulatorDatasetReporting:
+    Type: "AWS::IoTAnalytics::Dataset"
+    Properties:
+      RetentionPeriod:
+        Unlimited: false
+        NumberOfDays: 30    
+      Actions:
+        -
+          ActionName: "SqlAction"
+          QueryAction:
+            SqlQuery: !Join
+              - ''
+              - - 'select WirelessDeviceId, PayloadData, RealTime from '
+                - !Ref SidewalkSimulatorDatastore
+      Triggers:
+        -
+          Schedule:
+            ScheduleExpression: "cron(0 * * * ? *)"
+    DependsOn: SidewalkSimulatorDatastore
+
+  SidewalkSimulatorIoTActionRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      TopicRulePayload:
+        Description: "Routes device data"
+        Sql: SELECT *, parse_time("yyyy-MM-dd'T'HH:mm:ss.SSSZ", timestamp()) as RealTime FROM 'SidewalkSimulator/'
+        AwsIotSqlVersion: "2016-03-23"
+        RuleDisabled: False
+        Actions:
+          - IotAnalytics:
+              ChannelName: !Ref SidewalkSimulatorDataChannel
+              RoleArn:
+                Fn::GetAtt: [ RoleSidewalkSimulatorPipelineRole, "Arn" ]
+          - Lambda:
+              FunctionArn:
+                Fn::GetAtt: [SidewalkProcessLambdaFunction, "Arn"]   
+                
+  IoTProcessLambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt SidewalkProcessLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt SidewalkSimulatorIoTActionRule.Arn
+      
+  IoTTransformLambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt SidewalkTransformLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: iotanalytics.amazonaws.com
+
+  IoTThing:
+    # Resource creates thing, certificate key pair, IoT policy, and associates all
+    Type: Custom::IoTThing
+    Properties:
+      ServiceToken: !GetAtt CreateThingFunction.Arn
+      ThingName: !Ref ThingName
+      CertificateArn: !Ref CertificateArn
+  CreateThingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-CreateThingAndPolicy
+      Description: Create thing and policy, attach certificate
+      Handler: create_thing.handler
+      Runtime: python3.8
+      Role: !GetAtt RoleSidewalkLambdaExecutionRole.Arn
+      Timeout: 60
+      CodeUri: ./lambda_functions                  
+
+  SidewalkProcessLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Lambda Function to process data and send response to simulated device"
+      Handler: index.handler
+      Role: !GetAtt RoleSidewalkLambdaFunctionRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: 
+          !Sub 
+            - |-
+              #!/usr/bin/env python3
+
+              import json
+              import pkg_resources
+              # We need this package of boto3 or later for iotwireless
+              pkg_resources.require('boto3==1.17.42')
+              import boto3
+              import logging
+              import os
+              import random
+              import base64
+
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+
+              data_client = boto3.client('iot-data')
+              wirless_client = boto3.client('iotwireless')
+              message_id = 0
+
+
+              def send_data_to_wireless_device(device_id, payload_data, transmit_mode, wireless_metadata):
+
+                responseTopic = "/SidewalkSimulatorRule/response/"
+
+                response = {}
+                response["MessageId"] = str(message_id) 
+                response["DeviceId"] = device_id
+                response["PayloadData"] = payload_data
+                response["MetaData"] = wireless_metadata
+
+                data_client.publish(
+                  topic=responseTopic,
+                  qos=0,
+                  payload=json.dumps(response))
+
+                print('publishing on {}: {}'.format(responseTopic, json.dumps(response)))  
+
+              def encode_message(message):
+                message_bytes = message.encode('ascii')
+                base64_bytes = base64.b64encode(message_bytes)
+                base64_message = base64_bytes.decode('ascii')
+                return base64_message
+
+              def decode_message(base64_message):
+                base64_bytes = base64_message.encode('ascii')
+                message_bytes = base64.b64decode(base64_bytes)
+                message = message_bytes.decode('ascii')
+                return message
+
+              def handler(event, context):
+                global message_id 
+                message_id = message_id + 1
+
+                print(event)
+                device_data = decode_message(event["PayloadData"])
+                device_id = event["WirelessDeviceId"]
+                int_data = int(device_data)
+
+                print ("WirelessDeviceId : ", device_id)
+                print ("PayloadData : ", int_data)
+
+                returnData = int_data + 10
+                str_rtn = str(returnData)
+                print ("ReturnData : ", str_rtn)
+                encodeReturn = encode_message(str_rtn)
+                print ("encodeReturn : ", encodeReturn)  
+
+                wirelessmetaData = {}
+                wirelessmetaData["Sidewalk"] = {"Seq": message_id} 
+                print ("WirelessMetaData", wirelessmetaData)
+
+                # This will be for real device
+                #response = wireless_client.send_data_to_wireless_device(
+                #    Id=device_id,
+                #    PayloadData=encodeReturn,
+                #    TransmitMode=0,
+                #    WirelessMetadata=wirelessmetaData
+                #    )
+
+                # This is for simulator
+                response = send_data_to_wireless_device(device_id, encodeReturn, 0, wirelessmetaData)                
+
+                print ("Response")
+                print(response)
+
+                return                          
+            -
+              lambda_function_role_arn: !Ref RoleSidewalkLambdaFunctionRole
+
+  SidewalkTransformLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Lambda Function to decode data" 
+      Handler: index.handler
+      Role: !GetAtt RoleSidewalkLambdaFunctionRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: 
+          !Sub 
+            - |-
+              #!/usr/bin/env python3
+
+              import logging
+              import base64
+              
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+              
+              def decode_message(base64_message):
+                base64_bytes = base64_message.encode('ascii')
+                message_bytes = base64.b64decode(base64_bytes)
+                message = message_bytes.decode('ascii')
+                return message
+
+              def handler(event, context):                
+                logger.info("event before processing: {}".format(event))
+                  
+                for e in event:  
+                  if 'PayloadData' in e:
+                    device_data = decode_message(e['PayloadData'])
+                    e['PayloadData'] = device_data
+    
+                logger.info("event after processing: {}".format(event))
+              
+                return event                
+            -
+              lambda_function_role_arn: !Ref RoleSidewalkLambdaFunctionRole
