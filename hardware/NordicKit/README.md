@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. 
 ## SPDX-License-Identifier: CC-BY-SA-4.0
 
-# Sidewalk Hardware
+# Sidewalk Nordic Development Kit
 
 The sidewalk hardware details setting up a device with your AWS enviroment. The artifacts here will help you setup a flow detailed here:
 
